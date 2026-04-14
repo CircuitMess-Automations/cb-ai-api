@@ -1,11 +1,15 @@
 const Anthropic = require("@anthropic-ai/sdk").default;
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 const SK = process.env.STRIPE_SECRET_KEY || "";
 const MP = process.env.STRIPE_MONTHLY_PRICE_ID || "";
 const YP = process.env.STRIPE_YEARLY_PRICE_ID || "";
 const APP = "https://circuitmess-automations.github.io/circuitblocks-ai";
+
+let client = null;
+function getClient() {
+  if (!client) client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  return client;
+}
 
 async function callStripe(method, path, params) {
   if (!SK) throw new Error("Stripe not configured");
@@ -18,7 +22,6 @@ async function callStripe(method, path, params) {
   return r.json();
 }
 
-// In-memory stores
 const classrooms = new Map();
 const gallery = [];
 const redeemed = new Set();
@@ -31,12 +34,12 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const p = req.url.replace(/\?.*$/, "").replace(/^\/api/, "") || "/";
+  const p = (req.url || "/").replace(/\?.*$/, "").replace(/^\/api/, "");
 
   try {
-    // ── Health ──
+    // Health
     if (p === "/health") {
-      return res.json({ ok: true, stripe: !!SK, anthropic: !!process.env.ANTHROPIC_API_KEY });
+      return res.json({ ok: true, hasStripe: !!SK, hasAnthropic: !!process.env.ANTHROPIC_API_KEY });
     }
 
     // ── Billing ──
@@ -64,16 +67,13 @@ module.exports = async (req, res) => {
       const { email } = req.body;
       if (!email) return res.status(400).json({ error: "Email required" });
       const sub = subs.get(email);
-      if (sub) {
-        if (sub.expiresAt && Date.now() > sub.expiresAt) sub.status = "expired";
-        return res.json({ subscription: sub });
-      }
+      if (sub) { if (sub.expiresAt && Date.now() > sub.expiresAt) sub.status = "expired"; return res.json({ subscription: sub }); }
       if (SK) {
         try {
           const c = await callStripe("GET", "/customers", { email, limit: "1" });
           if (c.data?.length) {
             const sl = await callStripe("GET", "/subscriptions", { customer: c.data[0].id, status: "active", limit: "1" });
-            if (sl.data?.length) return res.json({ subscription: { status: "pro", plan: sl.data[0].items.data[0].price.id === YP ? "yearly" : "monthly", expiresAt: sl.data[0].current_period_end * 1000 } });
+            if (sl.data?.length) return res.json({ subscription: { status: "pro", plan: sl.data[0].items.data[0].price.id === YP ? "yearly" : "monthly" } });
           }
         } catch {}
       }
@@ -96,14 +96,13 @@ module.exports = async (req, res) => {
       redeemed.add(serial.toUpperCase());
       const expiresAt = Date.now() + 90 * 24 * 60 * 60 * 1000;
       if (email) subs.set(email, { status: "trial", plan: "device_redemption", expiresAt });
-      return res.json({ success: true, expiresAt, expiresDate: new Date(expiresAt).toISOString().split("T")[0], message: "3 months of Pro activated!" });
+      return res.json({ success: true, expiresAt, message: "3 months of Pro activated!" });
     }
 
     // ── Classroom ──
     if (p === "/classroom/create" && req.method === "POST") {
       const code = String(1000 + Math.floor(Math.random() * 9000));
       classrooms.set(code, { teacherName: req.body.teacherName || "Teacher", deviceId: req.body.deviceId || "", starterCode: req.body.starterCode || "", students: [], createdAt: Date.now() });
-      for (const [k, v] of classrooms) { if (Date.now() - v.createdAt > 7200000) classrooms.delete(k); }
       return res.json({ code, room: classrooms.get(code) });
     }
     if (p === "/classroom/join" && req.method === "POST") {
@@ -131,7 +130,6 @@ module.exports = async (req, res) => {
       if (!title || !code || !deviceId) return res.status(400).json({ error: "Missing fields" });
       const project = { id: `g_${Date.now()}`, title, description: description || "", deviceId, code, author: author || "Anonymous", createdAt: Date.now(), reactions: { fire: 0, heart: 0, star: 0 } };
       gallery.push(project);
-      while (gallery.length > 200) gallery.shift();
       return res.json({ project });
     }
     if (p === "/gallery/react" && req.method === "POST") {
@@ -143,28 +141,20 @@ module.exports = async (req, res) => {
 
     // ── Chat (default) ──
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-    const { messages, systemPrompt, stream } = req.body;
+    const { messages, systemPrompt } = req.body;
     if (!messages || !systemPrompt) return res.status(400).json({ error: "Missing messages or systemPrompt" });
 
-    if (stream) {
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      const s = await client.messages.stream({ model: "claude-sonnet-4-20250514", max_tokens: 4096, system: systemPrompt, messages });
-      for await (const event of s) {
-        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-          res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
-        }
-      }
-      res.write("data: [DONE]\n\n");
-      return res.end();
-    }
-
-    const response = await client.messages.create({ model: "claude-sonnet-4-20250514", max_tokens: 4096, system: systemPrompt, messages });
-    return res.json({ text: response.content.filter(b => b.type === "text").map(b => b.text).join("\n") });
+    const response = await getClient().messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages,
+    });
+    const text = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+    return res.json({ text });
 
   } catch (err) {
-    console.error("API error:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("API error:", err.message, err.stack);
+    return res.status(500).json({ error: err.message || "Internal error" });
   }
 };
